@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Wallet Report Card — How strong are those hands?</title>
+  <meta name="description" content="Grade any public EVM wallet's NFT holding behavior from its on-chain ERC-721 transfer history. No connection, no signing, nothing stored." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2310120f'/%3E%3Ctext x='16' y='23' font-size='19' font-family='monospace' font-weight='bold' fill='%23b9f227' text-anchor='middle'%3E%23%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <main>
+      <section class="intro-grid">
+        <div class="intro-copy">
+          <p class="mono-kicker">ERC-721 HOLDING ANALYSIS</p>
+          <h1>How strong are those hands?</h1>
+          <p class="intro-deck">Trace a wallet&rsquo;s NFT exits, hold times, and flip patterns&mdash;then turn the history into one inspectable score.</p>
+        </div>
+
+        <form class="scan-form" id="scan-form" novalidate>
+          <div class="field-group">
+            <label for="wallet-address">Wallet address</label>
+            <input
+              id="wallet-address"
+              name="wallet-address"
+              placeholder="0x&hellip;"
+              autocapitalize="off"
+              autocorrect="off"
+              spellcheck="false"
+              aria-describedby="wallet-hint"
+              aria-invalid="false"
+            />
+            <span id="wallet-hint" class="field-hint">Any public EVM wallet. Nothing is connected or signed.</span>
+          </div>
+
+          <div class="field-group">
+            <label for="chain-select">Chain</label>
+            <select id="chain-select">
+              <option value="base">Base &mdash; Blockscout</option>
+              <option value="ethereum">Ethereum &mdash; Blockscout</option>
+              <option value="robinhood">Robinhood Chain &mdash; Explorer + RPC fallback</option>
+            </select>
+          </div>
+
+          <button class="scan-button" id="scan-button" type="submit">Grade this wallet</button>
+        </form>
+      </section>
+
+      <div id="result"></div>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
