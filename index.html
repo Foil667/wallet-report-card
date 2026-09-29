@@ -4,9 +4,10 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Wallet Report Card — How strong are those hands?</title>
-  <meta name="description" content="Grade any public EVM wallet's NFT holding behavior from its on-chain ERC-721 transfer history. No connection, no signing, nothing stored." />
+  <meta name="description" content="Grade any public EVM wallet's NFT holding behavior from its on-chain ERC-721 transfer history. No connection, no signing. Reports persist locally and share via link." />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2310120f'/%3E%3Ctext x='16' y='23' font-size='19' font-family='monospace' font-weight='bold' fill='%23b9f227' text-anchor='middle'%3E%23%3C/text%3E%3C/svg%3E" />
   <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="rescue-burn.css" />
 </head>
 <body>
   <div class="app-shell">
@@ -16,6 +17,12 @@
           <p class="mono-kicker">ERC-721 HOLDING ANALYSIS</p>
           <h1>How strong are those hands?</h1>
           <p class="intro-deck">Trace a wallet&rsquo;s NFT exits, hold times, and flip patterns&mdash;then turn the history into one inspectable score.</p>
+          <nav class="page-nav" aria-label="Page sections">
+            <a href="#grade">Grade</a>
+            <a href="#history">History</a>
+            <a href="#board">Top Wallets</a>
+            <a href="#furnace">Burn Furnace</a>
+          </nav>
         </div>
 
         <form class="scan-form" id="scan-form" novalidate>
@@ -44,12 +51,38 @@
           </div>
 
           <button class="scan-button" id="scan-button" type="submit">Grade this wallet</button>
+          <div id="tier-line" class="tier-line" aria-live="polite"></div>
         </form>
       </section>
 
-      <div id="result"></div>
+      <section id="grade">
+        <div id="result"></div>
+      </section>
+
+      <section id="history" class="history-section">
+        <div class="section-heading"><span>Graded before (this device)</span><span>LOCAL</span></div>
+        <div id="history-list"></div>
+      </section>
+
+      <section id="board" class="board-section">
+        <div class="section-heading"><span>Top Wallets leaderboard</span><span>COMMUNITY</span></div>
+        <div id="board-list"></div>
+      </section>
+
+      <section id="furnace" class="furnace-section">
+        <div class="section-heading"><span>$RESCUE burn furnace</span><span>LIVE</span></div>
+        <p class="furnace-copy">Pro-grade demo fees burn a visible cut per run. The ledger below is real onchain $RESCUE burned to the dead address on Base — read live, never invented. The demo-burn tally under it is a client-side simulation, marked <span class="demo-pill">DEMO</span>.</p>
+        <div id="burn-widget"></div>
+        <div id="demo-furnace"></div>
+      </section>
+
+      <footer class="site-footer">
+        <p>Wallet Report Card · read-only · no wallet connection, no signatures, nothing leaves your browser except public chain queries.</p>
+      </footer>
     </main>
   </div>
+  <script src="rescue-burn.js"></script>
+  <script src="flywheel.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

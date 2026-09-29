@@ -3,6 +3,97 @@
 Static build: `index.html` + `styles.css` + `app.js`. No build step, no
 dependencies, no wallet connection, no signing, no storage.
 
+## Flywheel pass — 2026-09-28 ~16:30 CDT (persistence + share + $RESCUE flywheel)
+
+New files: `flywheel.js` (history/share/ledger/pro-grade/board/tiers),
+`rescue-burn.js` + `rescue-burn.css` (copied from `~/workspace/shared/`).
+Modified: `index.html` (new sections: history, Top Wallets, burn furnace;
+script/link wiring), `app.js` (persistence + share + pro wiring),
+`styles.css` (new components), `README.md`.
+
+### What was verified with real data
+
+**Full test suite: 54/54 PASS** (`/tmp/test-flywheel.mjs`, loads the real
+site JS in a vm sandbox with a fake DOM):
+
+- **History persistence (9 checks):** record → visits=2 keeps best=72;
+  `no_history` doesn't clobber best; key case-insensitive; fresh-context
+  "reload" with the same storage sees the entry; fresh device gets empty
+  history and a seeded ledger.
+- **Share state (7 checks):** `?address=&chain=` parse/build roundtrip;
+  invalid address → null; invalid chain → defaults `base`; full URL includes
+  origin; live end-to-end: after a real Base grade,
+  `history.replaceState` wrote `?address=0x7249…&chain=base` and the
+  clipboard-stub "Copy share link" produced the same URL.
+- **Live Base grading:** wallet `0x72491ba4Ef67a46809C4E79126f4d2Ea2DdecE0A`
+  graded end-to-end in-sandbox via `runScan()` — `report-shell` rendered,
+  Paper Hands, history entry persisted with `bestScore: 0`.
+  (Base Blockscout 500'd intermittently during testing; the app's retry
+  surfaced the report on a later attempt, and sustained 500s produce the
+  honest error panel — no partial scores, as before.)
+- **Pro grade (demo fee):** charge deducts 1,000 demo → balance 19,000,
+  burned +200, treasury +800, `proGradesRun` 1, tier → Analyst; tier
+  progression verified to Oracle at 15; overdraft refused; demo furnace
+  tally updated; pro metrics math verified on synthetic transfers
+  (flows/counterparty/collection shares) and the rendered HTML escapes
+  collection names (`Test <Collection>` → `Test &lt;Collection&gt;`).
+- **Leaderboard:** 2 seeded demo entries; add valid / reject dup / reject
+  bad address; grade + rank by score desc; remove works.
+- **Burn degradation (bogus RPC):** pre-seeded cache → `ok:true,
+  stale:true` with the real cached numbers; no cache → `ok:false` with no
+  invented numbers; widget renders the stale state honestly.
+- **Live burn read (real `mainnet.base.org`):** `getStatus()` → `ok:true,
+  stale:false`, synced to block 51920234 in ~2s, `total: 0.00 $RESCUE`
+  (the real onchain number — no burns yet), cached follow-up in 206ms.
+
+### Fixes applied during this pass
+
+- **Oracle tier was unreachable** (20,000-seed math: 15 pro grades cost
+  15,000 — caught by the test, fixed by raising the demo seed from 10,000
+  to 20,000).
+- **Shared burn module hardened:** `mainnet.base.org` 413s / drops
+  topic-filtered `eth_getLogs` wider than ~2k blocks (verified live:
+  1,000 ok, 2,500 flaky, 5,000+ consistent 413). Added adaptive range
+  halving (floor 400 blocks) + chunk 2,000 + 3 retries. The fix was mirrored
+  back into `~/workspace/shared/rescue-burn.js` so other builds inherit it;
+  the site copy and the shared copy are byte-identical. Before the fix, a
+  fresh-device burn widget could only show "unavailable"; now it syncs live.
+- **Base Blockscout flakiness** (see Known limitations) is unchanged.
+
+### Static + layout checks
+
+- `node --check` clean on `app.js`, `flywheel.js`, `rescue-burn.js`.
+- All 6 assets serve 200 over a local `python3 -m http.server`.
+- Narrow-layout review (no screenshots in sandbox): new sections use the
+  same responsive pattern as the existing CSS — single-column under 760px,
+  full-width buttons, `min-width: 320px` on root; the burn widget's own CSS
+  collapses its two columns under 520px. No fixed-width or overflow-prone
+  constructs added.
+
+### Known limitations (disclosed, not hidden)
+
+- History, demo ledger, and leaderboard live in `localStorage` — per device,
+  per browser. No server, no sync.
+- Demo $RESCUE is a client-side simulation, always badged DEMO; the only
+  real onchain numbers on the page are the burn furnace figures.
+- The burn furnace shows real zeros today ($RESCUE launched 2026-09-28; no
+  burns to the dead address yet) — that is the live chain state, not a bug.
+- Base Blockscout flakiness: the endpoint 500s intermittently; the retry
+  covers transient blips, but a sustained outage surfaces "Chain data is
+  unavailable" with a retry button. No score is ever issued from partial data.
+- Robinhood full-history scans are slow (public RPC, ~28k-block chunks);
+  wallets with >1,000 transfers are refused a score rather than scored
+  partially.
+- "Flip" is a proxy: the first outbound transfer after acquisition is
+  treated as the exit; gifts and plain wallet moves count as exits.
+
+## Push readiness
+
+Committed to `gh-pages` (commit hash in parent report). Not pushed — no
+remote configured and no stored credentials. After push: open the Pages URL,
+grade one wallet, confirm history persists across reload, open a share link
+in a fresh tab, run one demo pro grade, check the furnace syncs live.
+
 ## What was verified with real data
 
 **Scoring math (23 deterministic checks, all PASS)** — `wrc-scoring-test.mjs`

@@ -1,744 +1,1057 @@
-/* Wallet Report Card — static build.
- * Ported 1:1 from the original app's server actions (fetch + scoring) and
- * client UI. No wallet connection, no signing, no persistence: every scan is
- * a fresh live fetch of public chain data.
+'use strict';
+/* =====================================================================
+ * LOOPER RESCUE — read-only stuck-asset scanner (Base chain)
+ * ---------------------------------------------------------------------
+ * SAFETY ARCHITECTURE (non-negotiable):
+ * - This file is READ-ONLY. There is no code path that requests a
+ *   wallet, an account, a signature, a private key, or a transaction.
+ * - The scanned address comes from a plain text <input>, validated
+ *   against /^0x[0-9a-fA-F]{40}$/ before any network call.
+ * - No localStorage / sessionStorage / cookies. All state is in memory.
+ * - Recovery is an allowlist of official external links only
+ *   (target="_blank" rel="noopener"). This app never builds, signs,
+ *   or submits any transaction.
+ * - Outbound network is limited to: mainnet.base.org (Base RPC),
+ *   ethereum.publicnode.com (L1 RPC, allowlisted), api.merkl.xyz,
+ *   api.dexscreener.com, api.coinbase.com, base.blockscout.com
+ *   (Blockscout v2 read-only REST API — token-transfer discovery).
+ *   Nothing else is fetched.
+ *
+ * SCAN ARCHITECTURE (v2, 2026-09-28 — fixed the v1 hang):
+ * - v1 scanned ~2M blocks with raw eth_getLogs in 2,000-block chunks:
+ *   ~1,000 chunks for Transfer + ~1,000 each for TransferSingle and
+ *   TransferBatch + ~1,000 for MessagePassed = ~4,000 heavy chunk
+ *   requests, 20+ minutes of sustained network. Tabs died near
+ *   completion (renderer retired at 853/1001 and 910/1001 chunks).
+ * - v2 discovers token transfers via Blockscout's INDEXED
+ *   /api/v2/addresses/{addr}/token-transfers endpoint (full history,
+ *   paginated, ~1s for a normal wallet). Classification is unchanged:
+ *   the same onchain balanceOf/decimals/supportsInterface/ownerOf
+ *   checks run against the same discovered contracts — only the
+ *   discovery source changed, from slow to indexed. Scope WIDENED, not
+ *   narrowed (full history instead of last ~46 days).
+ * - Bridge withdrawals still use raw eth_getLogs on the
+ *   L2ToL1MessagePasser (address-filtered, 2,000-block chunks) because
+ *   that path was verified onchain and its semantics are documented
+ *   below. It is the only remaining chunked scan (~1,000 narrow
+ *   chunks), with progress, cancel, and timeouts.
+ * - Every network call has a timeout + retries with backoff; the whole
+ *   scan has a cancel button and an overall timeout; sections render
+ *   progressively as they complete instead of one big render at the end.
+ * ===================================================================== */
+
+/* ---------------------------------------------------------------------
+ * SELECTOR / EVENT-HASH VERIFICATION (build time, 2026-09-28)
+ * Computed locally with keccak256 (js-sha3) and cross-checked against
+ * live Base chain data:
+ * - 0x70a08231 balanceOf(address) ............ MATCH
+ * - 0x313ce567 decimals() .................... MATCH
+ * - 0x95d89b41 symbol() ...................... MATCH
+ * - 0x6352211e ownerOf(uint256) ............... MATCH
+ * - 0x00fdd58e balanceOf(address,uint256) ..... MATCH
+ * - 0x01ffc9a7 supportsInterface(bytes4) ...... MATCH
+ *   (spec draft listed 0x01ffc9d7 — that was a typo, corrected here)
+ * - Bridge withdrawals: the spec draft assumed
+ *   WithdrawalInitiated(address,address,address,address,uint256,bytes)
+ *   (= 0x73d170910aba9e6d50b102db522b1dbcd796216f5128b445aa2135272886497e,
+ *   computed as instructed) — but that event gets ZERO hits on the live
+ *   Base L2ToL1MessagePasser. The contract actually emits
+ *   MessagePassed(uint256,address,address,uint256,uint256,bytes,bytes32)
+ *   = 0x02a52367d10742d8032712c1bb8e0144ff1ec5ffda1ed7d70bb05a2744955054
+ *   (computed hash == topic0 observed onchain; 4 hits in 2,000 blocks).
+ *   Layout: topics[1]=nonce, topics[2]=sender, topics[3]=target (all indexed);
+ *   data = (value, gasLimit, bytes-offset, withdrawalHash, data...).
+ *   HONESTY NOTE: this app does NOT check L1 finalization status. The
+ *   "LIKELY STUCK" flag below is purely an age heuristic (>30 days old),
+ *   not a finality verdict. Finalization must be verified/completed in the
+ *   official bridge app (bridge.base.org).
+ * ------------------------------------------------------------------- */
+
+const BASE_RPC = 'https://mainnet.base.org';
+const L1_RPC = 'https://ethereum.publicnode.com'; // allowlisted; intentionally unused — no L1 state is queried by design
+const BASE_CHAIN_ID = 8453;
+const BLOCKSCOUT_API = 'https://base.blockscout.com/api/v2';
+
+const RESCUE_TOKEN = '0x8201132Bc218dbD81305Ff5605F44aE4804D4BA3';
+const RESCUE_POOL_ID = '0x7d5e38d1a39566b688de2e126fbdfc93560abe20db8dd0447bf5a4386581ce0e';
+const L2_TO_L1_PASSER = '0x4200000000000000000000000000000000000016';
+
+// Function selectors (4 bytes, verified above)
+const SEL_BALANCE_OF = '0x70a08231';        // balanceOf(address)
+const SEL_DECIMALS = '0x313ce567';          // decimals()
+const SEL_SYMBOL = '0x95d89b41';            // symbol()
+const SEL_OWNER_OF = '0x6352211e';          // ownerOf(uint256)
+const SEL_SUPPORTS_IFACE = '0x01ffc9a7';    // supportsInterface(bytes4)
+const SEL_BALANCE_OF_1155 = '0x00fdd58e';   // balanceOf(address,uint256)
+
+// Event topic0 hash (verified above)
+const TOPIC_MESSAGE_PASSED = '0x02a52367d10742d8032712c1bb8e0144ff1ec5ffda1ed7d70bb05a2744955054';
+
+// ERC-165 interface id for the ERC-721 check
+const IFACE_ERC721 = '0x80ac58cd';
+
+// Curated Base ERC-20s checked directly via balanceOf (symbol/decimals known).
+const CURATED_TOKENS = [
+  { address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', symbol: 'USDC', decimals: 6 },
+  { address: '0x4200000000000000000000000000000000000006', symbol: 'WETH', decimals: 18 },
+  { address: '0x50c5725949A6F0c72E6C4a641F3187595fC917', symbol: 'DAI', decimals: 18 },
+  { address: '0x2Ae3F1EC7D304cB47B4479C695df7Ac0e18Bef2', symbol: 'cbETH', decimals: 18 },
+  { address: '0x4ed4E862860bed51a9570b96d89aF5E1fDeAa1', symbol: 'DEGEN', decimals: 18 },
+  { address: '0x940181a94A35A4569E4529A3CDfB74e38FD9868c', symbol: 'AERO', decimals: 18 },
+  { address: RESCUE_TOKEN, symbol: 'RESCUE', decimals: 18 }, // the project's own token
+];
+
+const MERKL_API = 'https://api.merkl.xyz/v4/users/{address}/rewards?chainId=8453';
+const DEXSCREENER_API = 'https://api.dexscreener.com/latest/dex/tokens/0x8201132Bc218dbD81305Ff5605F44aE4804D4BA3';
+const COINBASE_ETH_USD = 'https://api.coinbase.com/v2/prices/ETH-USD/spot';
+
+// Scan tuning.
+const SCAN_BLOCKS = 2000000;      // bridge-withdrawal depth (~46 days at ~2s/block)
+const LOG_CHUNK = 2000;           // mainnet.base.org caps eth_getLogs at a 2,000-block range
+const CONCURRENCY = 6;
+const DUST_USD = 1.0;
+const STUCK_DAYS = 30;
+const FETCH_TIMEOUT_MS = 30000;   // per-request timeout
+const FETCH_TRIES = 3;            // attempts per request (with backoff)
+const SCAN_TIMEOUT_MS = 8 * 60 * 1000; // whole-scan ceiling -> honest timeout error
+// Worst-case guards (burn address etc.): degrade honestly, never hang.
+const DISCOVERY_PAGE_CAP = 20;    // Blockscout pages (50 transfers each)
+const CLASSIFY_CONTRACT_CAP = 300;
+const TOKEN_IDS_PER_CONTRACT_CAP = 500;
+
+/* ============================ pure helpers ============================ */
+
+function isValidAddress(s) {
+  return /^0x[0-9a-fA-F]{40}$/.test(s);
+}
+
+function normAddr(a) {
+  return a.toLowerCase();
+}
+
+// address -> 32-byte left-padded topic
+function addrToTopic(addr) {
+  return '0x' + '0'.repeat(24) + addr.slice(2).toLowerCase();
+}
+
+// topic (32-byte hex) -> address (last 20 bytes)
+function topicToAddr(topic) {
+  return '0x' + topic.slice(-40).toLowerCase();
+}
+
+// uint256 -> 32-byte hex (no 0x)
+function uintToHex(n) {
+  return BigInt(n).toString(16).padStart(64, '0');
+}
+
+function encBalanceOf(addr) {
+  return SEL_BALANCE_OF + addrToTopic(addr).slice(2);
+}
+
+function encBalanceOf1155(addr, id) {
+  return SEL_BALANCE_OF_1155 + addrToTopic(addr).slice(2) + uintToHex(id);
+}
+
+function encOwnerOf(id) {
+  return SEL_OWNER_OF + uintToHex(id);
+}
+
+function encSupportsInterface(ifaceId) {
+  return SEL_SUPPORTS_IFACE + '0'.repeat(56) + ifaceId.slice(2).toLowerCase();
+}
+// decode first 32 bytes as uint256 -> BigInt, or null on empty/malformed
+function decodeUint(data) {
+  if (!data || data === '0x' || data.length < 66) return null;
+  try {
+    return BigInt('0x' + data.slice(2, 66));
+  } catch (e) {
+    return null;
+  }
+}
+
+// decode ABI string OR legacy bytes32 string -> JS string, or null
+function decodeString(data) {
+  if (!data || data === '0x') return null;
+  try {
+    const hex = data.slice(2);
+    if (hex.length === 64) {
+      const bytes = [];
+      for (let i = 0; i < 64; i += 2) {
+        const b = parseInt(hex.slice(i, i + 2), 16);
+        if (b === 0) break;
+        bytes.push(b);
+      }
+      return new TextDecoder().decode(new Uint8Array(bytes)) || null;
+    }
+    if (hex.length < 128) return null;
+    const len = parseInt(hex.slice(64, 128), 16);
+    if (!Number.isSafeInteger(len) || len <= 0 || len > 200) return null;
+    const strHex = hex.slice(128, 128 + len * 2);
+    if (strHex.length !== len * 2) return null;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = parseInt(strHex.slice(i * 2, i * 2 + 2), 16);
+    if (bytes.includes(0)) return null;
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch (e) {
+    return null;
+  }
+}
+
+// BigInt token amount -> human string given decimals (trims trailing zeros)
+function formatUnits(value, decimals) {
+  const neg = value < 0n;
+  const v = neg ? -value : value;
+  const base = 10n ** BigInt(decimals);
+  const whole = v / base;
+  let frac = (v % base).toString().padStart(decimals, '0').replace(/0+$/, '');
+  if (frac.length > 6) frac = frac.slice(0, 6);
+  const s = frac ? whole.toString() + '.' + frac : whole.toString();
+  return (neg ? '-' : '') + s;
+}
+
+function formatUsd(n) {
+  if (n == null || !isFinite(n)) return '—';
+  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function shortAddr(a) {
+  return a.slice(0, 6) + '…' + a.slice(-4);
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function abortError() {
+  return new DOMException('scan cancelled', 'AbortError');
+}
+
+function checkAborted(signal) {
+  if (signal && signal.aborted) throw abortError();
+}
+
+/* ============================ network layer (read-only) ============================
+ * Only JSON-RPC POSTs to mainnet.base.org (read-only methods: eth_chainId,
+ * eth_blockNumber, eth_getBalance, eth_call, eth_getLogs)
+ * and GETs to the allowlisted REST APIs. Every request has a timeout and
+ * retries with backoff. Nothing here can write.
  */
-"use strict";
 
-const CHAINS = {
-  base: { label: "Base", note: "Blockscout", blockscout: "https://base.blockscout.com" },
-  ethereum: { label: "Ethereum", note: "Blockscout", blockscout: "https://eth.blockscout.com" },
-  robinhood: { label: "Robinhood Chain", note: "Explorer + RPC fallback", blockscout: "https://robinhoodchain.blockscout.com" },
-};
-
-const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-const ROBINHOOD_RPC = "https://rpc.mainnet.chain.robinhood.com";
-const MAX_TRANSFERS = 1000;
-const MAX_BLOCKSCOUT_PAGES = 20;
-const RH_CHUNK_SIZE = 29900;      // RH RPC rejects eth_getLogs spans above ~30k blocks
-const RH_BATCH_SIZE = 12;         // JSON-RPC batch calls per POST (small bursts avoid 429s)
-const RH_INTER_BATCH_MS = 400;    // pacing between batches
-const RH_MAX_CHUNKS = 6000;       // safety ceiling on full-history chunk count
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-class SourceFailure extends Error {
-  constructor(message, code = "SOURCE_UNAVAILABLE", status = null) {
-    super(message);
-    this.code = code;
-    this.status = status;
-  }
-}
-
-const normalizeAddress = (value) => value.toLowerCase();
-const isAddress = (value) => /^0x[0-9a-fA-F]{40}$/.test(value);
-const round = (value, digits = 1) => {
-  const scale = 10 ** digits;
-  return Math.round(value * scale) / scale;
-};
-const shortAddress = (value) => `${value.slice(0, 6)}…${value.slice(-4)}`;
-const esc = (value) => String(value)
-  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-  .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-
-function formatDuration(days) {
-  if (days === null) return "No exits yet";
-  if (days < 1) return `${Math.max(1, Math.round(days * 24))} hr`;
-  if (days < 60) return `${days.toLocaleString(undefined, { maximumFractionDigits: 1 })} days`;
-  if (days < 730) return `${(days / 30.4375).toLocaleString(undefined, { maximumFractionDigits: 1 })} months`;
-  return `${(days / 365.25).toLocaleString(undefined, { maximumFractionDigits: 1 })} years`;
-}
-
-function formatTimestamp(value) {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
-}
-
-async function fetchJson(url, init = {}, timeoutMs = 12000) {
-  // Transient 5xx / 429 / network blips from public explorers are retried with
-  // backoff; anything else fails fast so error states stay honest.
-  const MAX_ATTEMPTS = 3;
-  let delay = 1000;
-  for (let attempt = 1; ; attempt += 1) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response = null;
-    let networkError = null;
+async function fetchJson(url, { timeoutMs, tries, signal, method, body } = {}) {
+  timeoutMs = timeoutMs == null ? FETCH_TIMEOUT_MS : timeoutMs;
+  tries = tries == null ? FETCH_TRIES : tries;
+  let lastErr = null;
+  for (let i = 0; i < tries; i++) {
+    checkAborted(signal);
+    const ctrl = new AbortController();
+    const onAbort = () => ctrl.abort();
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      response = await fetch(url, { ...init, signal: controller.signal });
-    } catch (error) {
-      networkError = error;
+      const res = await fetch(url, {
+        method: method || 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        signal: ctrl.signal,
+      });
+      if (!res.ok) {
+        const err = new Error('HTTP ' + res.status);
+        err.status = res.status;
+        throw err;
+      }
+      const text = await res.text();
+      if (!text) throw new Error('empty response');
+      return JSON.parse(text);
+    } catch (e) {
+      lastErr = e;
+      if (e && e.name === 'AbortError' && signal && signal.aborted) throw abortError();
+      // Retry on 429 / 5xx / network failures / empty responses / timeouts.
+      const s = e && e.status;
+      const retryable = s === 429 || s === 0 || s == null || (s >= 500 && s < 600) || e.message === 'empty response';
+      if (!retryable || i === tries - 1) throw e;
+      await sleep(800 * (i + 1) + Math.random() * 500);
     } finally {
-      clearTimeout(timer);
-    }
-    const retryable = networkError !== null
-      || response.status === 429
-      || (response.status >= 500 && response.status < 600);
-    if (retryable && attempt < MAX_ATTEMPTS) {
-      await sleep(delay);
-      delay = Math.min(delay * 2, 8000);
-      continue;
-    }
-    if (networkError) {
-      throw new SourceFailure("The chain data source did not respond in time.");
-    }
-    const contentType = response.headers.get("content-type") ?? "";
-    if (!response.ok) {
-      throw new SourceFailure(`The chain data source returned HTTP ${response.status}.`, "SOURCE_UNAVAILABLE", response.status);
-    }
-    if (!contentType.toLowerCase().includes("json")) {
-      throw new SourceFailure("The chain data source returned a non-data response.", "INVALID_RESPONSE");
-    }
-    try {
-      return await response.json();
-    } catch {
-      throw new SourceFailure("The chain data source returned unreadable data.", "INVALID_RESPONSE");
+      clearTimeout(t);
+      if (signal) signal.removeEventListener('abort', onAbort);
     }
   }
+  throw lastErr;
 }
 
-function asRecord(value) {
-  return typeof value === "object" && value !== null ? value : null;
-}
-
-function readAddress(value) {
-  const record = asRecord(value);
-  const hash = record?.hash;
-  return typeof hash === "string" && isAddress(hash) ? normalizeAddress(hash) : null;
-}
-
-function parseBlockscoutTransfer(value) {
-  const item = asRecord(value);
-  if (!item) throw new SourceFailure("A transfer row was malformed.", "INVALID_RESPONSE");
-  const token = asRecord(item.token);
-  const total = asRecord(item.total);
-  const from = readAddress(item.from);
-  const to = readAddress(item.to);
-  const contract = typeof token?.address_hash === "string" ? normalizeAddress(token.address_hash) : "";
-  const tokenIdValue = total?.token_id ?? item.token_id;
-  const tokenId = typeof tokenIdValue === "string" || typeof tokenIdValue === "number" ? String(tokenIdValue) : "";
-  const timestampMs = typeof item.timestamp === "string" ? Date.parse(item.timestamp) : Number.NaN;
-  const blockNumber = typeof item.block_number === "number" ? item.block_number : Number(item.block_number);
-  const logIndex = typeof item.log_index === "number" ? item.log_index : Number(item.log_index ?? 0);
-  const tokenType = typeof token?.type === "string" ? token.type : "";
-  // Blockscout's type=ERC-721 filter can leak ERC-404 hybrid rows (they emit
-  // ERC-721-shaped Transfer events). Skip them; this is an ERC-721 analysis.
-  if (tokenType !== "ERC-721") return null;
-  if (!from || !to || !isAddress(contract) || !tokenId || !Number.isFinite(timestampMs) || !Number.isFinite(blockNumber) || !Number.isFinite(logIndex)) {
-    throw new SourceFailure("A transfer row was missing required ERC-721 fields.", "INVALID_RESPONSE");
+async function rpc(method, params, signal) {
+  const body = await fetchJson(BASE_RPC, {
+    method: 'POST',
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    signal,
+  });
+  if (body.error) {
+    const err = new Error('RPC error: ' + body.error.message);
+    err.status = body.error.code;
+    throw err;
   }
-  return {
-    blockNumber, logIndex, timestampMs, from, to, contract, tokenId,
-    collectionName: typeof token?.name === "string" && token.name.trim() ? token.name.trim() : null,
-  };
+  return body.result;
 }
 
-async function loadBlockscoutTransfers(chain, address) {
-  const base = `${CHAINS[chain].blockscout}/api/v2/addresses/${address}/token-transfers`;
-  let next = null;
-  const rows = [];
-  const seen = new Set();
+function ethCall(to, data, block, signal) {
+  return rpc('eth_call', [{ to, data }, block || 'latest'], signal);
+}
 
-  for (let page = 0; page < MAX_BLOCKSCOUT_PAGES; page += 1) {
-    const url = new URL(base);
-    url.searchParams.set("type", "ERC-721");
-    if (next) {
-      for (const [key, value] of Object.entries(next)) {
-        if (value !== null && value !== undefined) url.searchParams.set(key, String(value));
+function getBalance(addr, signal) {
+  return rpc('eth_getBalance', [addr, 'latest'], signal);
+}
+
+function getBlockNumber(signal) {
+  return rpc('eth_blockNumber', [], signal);
+}
+
+// Run tasks with at most `limit` concurrent workers. Aborts promptly when
+// `signal` fires. Resolves to an array of {ok:true,value}/{ok:false,error}.
+async function pool(tasks, limit, onProgress, signal) {
+  const results = new Array(tasks.length);
+  let next = 0;
+  let done = 0;
+  async function worker() {
+    while (next < tasks.length) {
+      checkAborted(signal);
+      const idx = next++;
+      try {
+        results[idx] = { ok: true, value: await tasks[idx]() };
+      } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+        results[idx] = { ok: false, error: e };
       }
-    }
-    const payload = asRecord(await fetchJson(url.toString()));
-    if (!payload || !Array.isArray(payload.items)) {
-      throw new SourceFailure("The explorer returned an unexpected response.", "INVALID_RESPONSE");
-    }
-    for (const raw of payload.items) {
-      const transfer = parseBlockscoutTransfer(raw);
-      if (!transfer) continue;
-      const key = `${transfer.blockNumber}:${transfer.logIndex}:${transfer.contract}:${transfer.tokenId}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        rows.push(transfer);
-      }
-    }
-    next = payload.next_page_params && typeof payload.next_page_params === "object" ? payload.next_page_params : null;
-    if (!next) return rows;
-    if (rows.length >= MAX_TRANSFERS) {
-      throw new SourceFailure("This wallet has more than 1,000 NFT transfers, so a complete score would be unsafe.", "HISTORY_TOO_LARGE");
+      done++;
+      if (onProgress) onProgress(done, tasks.length);
+      // Yield to the UI thread between tasks so the page stays responsive.
+      await sleep(0);
     }
   }
-  throw new SourceFailure("This wallet has more history than can be scored safely in one scan.", "HISTORY_TOO_LARGE");
-}
-
-/* ---- Robinhood Chain: public JSON-RPC fallback ---- */
-
-function hexNumber(value) {
-  if (typeof value !== "string" || !/^0x[0-9a-fA-F]+$/.test(value)) return null;
-  const parsed = Number.parseInt(value.slice(2), 16);
-  return Number.isSafeInteger(parsed) ? parsed : null;
-}
-
-function topicAddress(topic) {
-  if (!/^0x[0-9a-fA-F]{64}$/.test(topic)) return null;
-  return normalizeAddress(`0x${topic.slice(-40)}`);
-}
-
-async function rpcBatch(calls, timeoutMs = 60000) {
-  const payload = calls.map((call, index) => ({ jsonrpc: "2.0", id: index, ...call }));
-  const body = await fetchJson(ROBINHOOD_RPC, {
-    method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json" },
-    body: JSON.stringify(payload),
-  }, timeoutMs);
-  const results = new Array(calls.length).fill(null);
-  if (!Array.isArray(body)) {
-    throw new SourceFailure("Robinhood Chain returned an unexpected response.", "INVALID_RESPONSE");
-  }
-  for (const entry of body) {
-    const record = asRecord(entry);
-    if (record && typeof record.id === "number" && record.id >= 0 && record.id < results.length) {
-      results[record.id] = record;
-    }
-  }
+  const n = Math.min(limit, tasks.length);
+  await Promise.all(Array.from({ length: n }, worker));
   return results;
 }
 
-async function rpcBatchWithRetry(calls, attempts = 8) {
-  let delay = 1000;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+// Chunked eth_getLogs over [fromBlock, toBlock] (inclusive), chunk size LOG_CHUNK.
+// Throws if any chunk fails (after retries) — the caller turns that into a
+// "section unavailable" card, never a silent partial scan.
+async function getLogsChunked(filterBase, fromBlock, toBlock, onProgress, signal) {
+  const ranges = [];
+  for (let s = fromBlock; s <= toBlock; s += LOG_CHUNK) {
+    ranges.push([s, Math.min(s + LOG_CHUNK - 1, toBlock)]);
+  }
+  const tasks = ranges.map(([s, e]) => () =>
+    rpc('eth_getLogs', [{
+      address: filterBase.address,
+      topics: filterBase.topics,
+      fromBlock: '0x' + s.toString(16),
+      toBlock: '0x' + e.toString(16),
+    }], signal)
+  );
+  const results = await pool(tasks, CONCURRENCY, onProgress, signal);
+  const failed = results.filter((r) => !r.ok);
+  if (failed.length > 0) {
+    throw new Error(failed.length + ' of ' + results.length + ' log chunks failed');
+  }
+  const logs = [];
+  for (const r of results) logs.push(...r.value);
+  return logs;
+}
+
+/* ============================ scan sections ============================
+ * Each section is read-only and returns plain data (no DOM). Failures
+ * throw; runScan() converts them into per-section "unavailable" cards.
+ */
+
+async function fetchEthUsd(signal) {
+  const j = await fetchJson(COINBASE_ETH_USD, { signal });
+  const v = parseFloat(j && j.data && j.data.amount);
+  if (!isFinite(v)) throw new Error('bad price response');
+  return v;
+}
+
+async function checkChainId(signal) {
+  const id = await rpc('eth_chainId', [], signal);
+  if (id !== '0x' + BASE_CHAIN_ID.toString(16)) throw new Error('unexpected chain id ' + id + ' (expected Base 8453)');
+}
+
+// 1. Native ETH
+async function scanNative(addr, ethUsd, signal) {
+  const balHex = await getBalance(addr, signal);
+  const wei = BigInt(balHex);
+  const usd = ethUsd != null ? Number(wei) / 1e18 * ethUsd : null;
+  return { wei, usd, dust: usd != null && usd < DUST_USD };
+}
+
+// 2a. Curated ERC-20s via balanceOf
+async function scanCurated(addr, signal) {
+  const tasks = CURATED_TOKENS.map((t) => async () => {
+    const raw = await ethCall(t.address, encBalanceOf(addr), 'latest', signal);
+    const bal = decodeUint(raw);
+    if (bal == null || bal === 0n) return null;
+    return { contract: t.address, symbol: t.symbol, decimals: t.decimals, balance: bal, curated: true };
+  });
+  const results = await pool(tasks, CONCURRENCY, null, signal);
+  return results.filter((r) => r.ok && r.value).map((r) => r.value);
+}
+
+// 2b/3/4. Token-transfer discovery via Blockscout's indexed API (full history,
+// paginated). Returns Map contract -> { types:Set, tokenIds:Set, symbol, name, decimals }.
+// Worst-case guard: stops after DISCOVERY_PAGE_CAP pages and reports truncation.
+async function discoverViaBlockscout(addr, onProgress, signal) {
+  const me = normAddr(addr);
+  const contracts = new Map();
+  let pageParams = null;
+  let pages = 0;
+  let totalSeen = 0;
+  let truncated = false;
+  let pageError = false;
+  for (;;) {
+    checkAborted(signal);
+    let url = BLOCKSCOUT_API + '/addresses/' + addr + '/token-transfers';
+    if (pageParams) url += '?' + new URLSearchParams(pageParams).toString();
+    let j;
     try {
-      return await rpcBatch(calls);
-    } catch (error) {
-      if (attempt === attempts) throw error;
-      // HTTP 429 (rate limit) needs much longer backoff than a transient blip.
-      const cap = error instanceof SourceFailure && error.status === 429 ? 45000 : 15000;
-      await sleep(delay);
-      delay = Math.min(delay * 2, cap);
+      j = await fetchJson(url, { signal });
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      // Keep the pages already collected and degrade honestly instead of
+      // failing the whole section (Blockscout 500s on some huge histories).
+      pageError = true;
+      truncated = true;
+      break;
     }
-  }
-  throw new SourceFailure("Robinhood Chain data is unavailable right now.");
-}
-
-async function fetchRpcBatch(slice, attempts = 6) {
-  // Retries one JSON-RPC batch slice. Per-entry "timed out" errors are
-  // transient on the RH public RPC and retried; a range-limit error is a
-  // hard stop; anything else aborts the scan.
-  let delay = 1500;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const entries = await rpcBatchWithRetry(slice);
-    if (entries.every((entry) => entry === null)) {
-      throw new SourceFailure("Robinhood Chain returned an empty batch response.", "INVALID_RESPONSE");
-    }
-    let timedOut = false;
-    for (const entry of entries) {
-      const record = asRecord(entry);
-      const message = typeof record?.error?.message === "string" ? record.error.message : null;
-      if (!message) continue;
-      if (/limit|too many|range|exceed/i.test(message)) {
-        throw new SourceFailure(message, "HISTORY_TOO_LARGE");
-      }
-      if (/timed out/i.test(message)) {
-        timedOut = true;
-        break;
-      }
-      throw new SourceFailure(message, "SOURCE_UNAVAILABLE");
-    }
-    if (!timedOut) return entries;
-    if (attempt === attempts) {
-      throw new SourceFailure("Robinhood Chain log queries kept timing out.", "SOURCE_UNAVAILABLE");
-    }
-    await sleep(delay);
-    delay = Math.min(delay * 2, 20000);
-  }
-  throw new SourceFailure("Robinhood Chain data is unavailable right now.");
-}
-
-async function loadRobinhoodRpcTransfers(address, onProgress) {
-  const [chainIdEntry, latestEntry] = await rpcBatchWithRetry([
-    { method: "eth_chainId", params: [] },
-    { method: "eth_blockNumber", params: [] },
-  ]);
-  if (asRecord(chainIdEntry)?.result !== "0x1237") {
-    throw new SourceFailure("The Robinhood RPC reported the wrong chain.", "INVALID_RESPONSE");
-  }
-  const latest = hexNumber(asRecord(latestEntry)?.result);
-  if (latest === null) throw new SourceFailure("Robinhood Chain returned an invalid block number.", "INVALID_RESPONSE");
-
-  const chunks = [];
-  for (let from = 0; from <= latest; from += RH_CHUNK_SIZE) {
-    chunks.push([from, Math.min(from + RH_CHUNK_SIZE - 1, latest)]);
-  }
-  if (chunks.length > RH_MAX_CHUNKS) {
-    throw new SourceFailure("Robinhood Chain history exceeded the safe live-query budget.", "HISTORY_TOO_LARGE");
-  }
-
-  const padded = `0x${address.slice(2).padStart(64, "0")}`;
-  const jobs = [];
-  for (const [from, to] of chunks) {
-    const params = { fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}` };
-    jobs.push({ method: "eth_getLogs", params: [{ ...params, topics: [TRANSFER_TOPIC, null, padded] }] });
-    jobs.push({ method: "eth_getLogs", params: [{ ...params, topics: [TRANSFER_TOPIC, padded] }] });
-  }
-
-  const unique = new Map();
-  let done = 0;
-  for (let index = 0; index < jobs.length; index += RH_BATCH_SIZE) {
-    const slice = jobs.slice(index, index + RH_BATCH_SIZE);
-    const entries = await fetchRpcBatch(slice);
-    if (index + RH_BATCH_SIZE < jobs.length) await sleep(RH_INTER_BATCH_MS);
-    for (const entry of entries) {
-      const record = asRecord(entry);
-      if (!record) continue;
-      const logs = Array.isArray(record.result) ? record.result : [];
-      for (const log of logs) {
-        const logRecord = asRecord(log);
-        const topics = logRecord?.topics;
-        if (!Array.isArray(topics) || topics.length !== 4 || !topics.every((topic) => typeof topic === "string")) continue;
-        const key = `${String(logRecord?.transactionHash)}:${String(logRecord?.logIndex)}`;
-        unique.set(key, log);
-      }
-    }
-    done += slice.length;
-    if (onProgress) onProgress(done, jobs.length);
-    if (unique.size > MAX_TRANSFERS) {
-      throw new SourceFailure("This wallet has more than 1,000 NFT transfers, so a complete score would be unsafe.", "HISTORY_TOO_LARGE");
-    }
-  }
-
-  // Block timestamps, only for blocks that actually contain this wallet's transfers.
-  const blockNumbers = new Set();
-  for (const log of unique.values()) {
-    const block = hexNumber(asRecord(log)?.blockNumber);
-    if (block === null) throw new SourceFailure("Robinhood Chain returned a malformed log.", "INVALID_RESPONSE");
-    blockNumbers.add(block);
-  }
-  const timestamps = new Map();
-  const blocks = [...blockNumbers];
-  const BLOCK_BATCH = 200;
-  for (let index = 0; index < blocks.length; index += BLOCK_BATCH) {
-    const slice = blocks.slice(index, index + BLOCK_BATCH).map((block) => ({
-      method: "eth_getBlockByNumber",
-      params: [`0x${block.toString(16)}`, false],
-    }));
-    const entries = await fetchRpcBatch(slice);
-    for (let j = 0; j < entries.length; j += 1) {
-      const result = asRecord(asRecord(entries[j])?.result);
-      const seconds = hexNumber(result?.timestamp);
-      if (seconds === null) throw new SourceFailure("Robinhood Chain omitted a block timestamp.", "INVALID_RESPONSE");
-      timestamps.set(blocks[index + j], seconds * 1000);
-    }
-  }
-
-  const transfers = [];
-  for (const log of unique.values()) {
-    const record = asRecord(log);
-    const topics = Array.isArray(record?.topics) ? record.topics : [];
-    const from = typeof topics[1] === "string" ? topicAddress(topics[1]) : null;
-    const to = typeof topics[2] === "string" ? topicAddress(topics[2]) : null;
-    const tokenIdRaw = typeof topics[3] === "string" ? topics[3] : "";
-    const blockNumber = hexNumber(record?.blockNumber);
-    const logIndex = hexNumber(record?.logIndex);
-    const contract = typeof record?.address === "string" ? normalizeAddress(record.address) : "";
-    if (!from || !to || blockNumber === null || logIndex === null || !isAddress(contract) || !/^0x[0-9a-fA-F]{64}$/.test(tokenIdRaw)) {
-      throw new SourceFailure("Robinhood Chain returned a malformed NFT transfer.", "INVALID_RESPONSE");
-    }
-    const timestampMs = timestamps.get(blockNumber);
-    if (timestampMs === undefined) throw new SourceFailure("Robinhood Chain omitted transfer timing.", "INVALID_RESPONSE");
-    transfers.push({ blockNumber, logIndex, timestampMs, from, to, contract, tokenId: BigInt(tokenIdRaw).toString(), collectionName: null });
-  }
-  return transfers;
-}
-
-/* ---- Scoring (identical math to the original) ---- */
-
-function ratingFor(score) {
-  if (score >= 80) return "Diamond Hands";
-  if (score >= 60) return "Steady Holder";
-  if (score >= 35) return "Active Flipper";
-  return "Paper Hands";
-}
-
-function durationText(days) {
-  if (days < 1) return `${Math.max(1, Math.round(days * 24))}h`;
-  if (days < 60) return `${round(days, 1)}d`;
-  if (days < 730) return `${round(days / 30.4375, 1)}mo`;
-  return `${round(days / 365.25, 1)}y`;
-}
-
-function computeReport(chain, address, source, transfers, analyzedAt) {
-  const wallet = normalizeAddress(address);
-  const sorted = [...transfers].sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex);
-  const open = new Map();
-  const cycles = [];
-  const distinct = new Set();
-
-  for (const event of sorted) {
-    const inbound = event.to === wallet && event.from !== wallet;
-    const outbound = event.from === wallet && event.to !== wallet;
-    if (!inbound && !outbound) continue;
-    const key = `${event.contract}:${event.tokenId}`;
-    if (inbound) {
-      if (!open.has(key)) {
-        const cycle = { contract: event.contract, tokenId: event.tokenId, collectionName: event.collectionName, startedAt: event.timestampMs, endedAt: null };
-        open.set(key, cycle);
-        cycles.push(cycle);
-        distinct.add(key);
-      }
-    } else {
-      const cycle = open.get(key);
-      if (cycle) {
-        cycle.endedAt = Math.max(event.timestampMs, cycle.startedAt);
-        open.delete(key);
-      }
-    }
-  }
-
-  const chainLabel = CHAINS[chain].label;
-  if (cycles.length === 0) {
-    return {
-      status: "no_history", chain, chainLabel, address, analyzedAt, source,
-      message: "No complete ERC-721 acquisition history was found for this wallet on this chain.",
-    };
-  }
-
-  const now = Date.parse(analyzedAt);
-  const DAY = 86400000;
-  const durations = cycles.map((cycle) => ({ cycle, days: Math.max(0, ((cycle.endedAt ?? now) - cycle.startedAt) / DAY) }));
-  const sold = durations.filter(({ cycle }) => cycle.endedAt !== null);
-  const observedAges = cycles.map((cycle) => Math.max(0, (now - cycle.startedAt) / DAY));
-  const sevenDayEligible = durations.filter((item) => item.cycle.endedAt !== null || (now - item.cycle.startedAt) / DAY >= 7);
-  const thirtyDayEligible = durations.filter((item) => item.cycle.endedAt !== null || (now - item.cycle.startedAt) / DAY >= 30);
-  if (thirtyDayEligible.length === 0) {
-    const oldestHoldDays = Math.max(...observedAges);
-    return {
-      status: "insufficient_history", chain, chainLabel, address, analyzedAt, source,
-      message: "This wallet has NFT activity, but none of its acquisitions has completed a 30-day observation window or exited yet. A score now would overstate its holding behavior.",
-      currentHoldings: open.size,
-      acquisitionCycles: cycles.length,
-      oldestHoldDays: round(oldestHoldDays, 1),
-      daysUntilEligible: Math.max(0, Math.ceil(30 - oldestHoldDays)),
-    };
-  }
-  const averageHoldDays = durations.reduce((sum, item) => sum + item.days, 0) / durations.length;
-  const averageTimeToSellDays = sold.length ? sold.reduce((sum, item) => sum + item.days, 0) / sold.length : null;
-  const flip7Percent = (sevenDayEligible.filter((item) => item.cycle.endedAt !== null && item.days <= 7).length / sevenDayEligible.length) * 100;
-  const flip30Percent = (thirtyDayEligible.filter((item) => item.cycle.endedAt !== null && item.days <= 30).length / thirtyDayEligible.length) * 100;
-  const longest = durations.reduce((best, item) => (item.days > best.days ? item : best), durations[0]);
-  const holdPoints = 50 * Math.min(averageHoldDays / 365, 1);
-  const sevenDayPoints = 30 * (1 - flip7Percent / 100);
-  const thirtyDayPoints = 20 * (1 - flip30Percent / 100);
-  const score = Math.max(0, Math.min(100, Math.round(holdPoints + sevenDayPoints + thirtyDayPoints)));
-  const rating = ratingFor(score);
-  const metrics = {
-    averageHoldDays: round(averageHoldDays, 1),
-    flip7Percent: round(flip7Percent, 1),
-    flip30Percent: round(flip30Percent, 1),
-    flip7EligibleCycles: sevenDayEligible.length,
-    flip30EligibleCycles: thirtyDayEligible.length,
-    averageTimeToSellDays: averageTimeToSellDays === null ? null : round(averageTimeToSellDays, 1),
-    totalDistinctNfts: distinct.size,
-    currentHoldings: open.size,
-    acquisitionCycles: cycles.length,
-    soldCycles: sold.length,
-    longestHeld: {
-      contract: longest.cycle.contract,
-      tokenId: longest.cycle.tokenId,
-      collectionName: longest.cycle.collectionName,
-      durationDays: round(longest.days, 1),
-      ongoing: longest.cycle.endedAt === null,
-    },
-  };
-  const receipt = [
-    `WALLET REPORT CARD — ${chainLabel.toUpperCase()}`,
-    shortAddress(address),
-    `${score}/100 · ${rating.toUpperCase()}`,
-    `Avg hold ${durationText(metrics.averageHoldDays)} · 7d flips ${metrics.flip7Percent}% · 30d flips ${metrics.flip30Percent}%`,
-    `${metrics.totalDistinctNfts} NFTs ever · ${metrics.currentHoldings} held now`,
-    `Checked ${analyzedAt.slice(0, 10)} · ${source}`,
-  ].join("\n");
-
-  return {
-    status: "ok", chain, chainLabel, address, analyzedAt, source, score, rating, metrics,
-    formula: {
-      holdPoints: round(holdPoints, 1),
-      sevenDayPoints: round(sevenDayPoints, 1),
-      thirtyDayPoints: round(thirtyDayPoints, 1),
-      explanation: "50 × min(avg hold days ÷ 365, 1) + 30 × (1 − 7d flip rate) + 20 × (1 − 30d flip rate)",
-    },
-    receipt,
-  };
-}
-
-async function analyzeWallet(address, chain, onProgress) {
-  const analyzedAt = new Date().toISOString();
-  const chainLabel = CHAINS[chain].label;
-  try {
-    if (chain === "robinhood") {
-      try {
-        const transfers = await loadBlockscoutTransfers(chain, address);
-        return computeReport(chain, address, "Robinhood Blockscout", transfers, analyzedAt);
-      } catch (blockscoutError) {
-        try {
-          const transfers = await loadRobinhoodRpcTransfers(normalizeAddress(address), onProgress);
-          return computeReport(chain, address, "Robinhood public RPC", transfers, analyzedAt);
-        } catch (rpcError) {
-          const failure = rpcError instanceof SourceFailure ? rpcError : new SourceFailure("Robinhood Chain data is unavailable right now.");
-          return {
-            status: "error", chain, chainLabel, address, analyzedAt,
-            source: "Robinhood Blockscout + public RPC",
-            code: failure.code,
-            message: failure.code === "HISTORY_TOO_LARGE"
-              ? failure.message
-              : "Robinhood Chain history could not be completed from either public source. No score was calculated.",
-          };
+    const items = Array.isArray(j.items) ? j.items : [];
+    pages++;
+    totalSeen += items.length;
+    for (const it of items) {
+      const to = it.to && it.to.hash ? normAddr(it.to.hash) : null;
+      if (to !== me) continue; // inbound only
+      const token = it.token || {};
+      const contract = token.address_hash ? normAddr(token.address_hash) : null;
+      if (!contract) continue;
+      let e = contracts.get(contract);
+      if (!e) {
+        let dec = null;
+        if (token.decimals != null && token.decimals !== '') {
+          const d = parseInt(token.decimals, 10);
+          if (Number.isSafeInteger(d) && d >= 0 && d <= 36) dec = d;
         }
+        e = { types: new Set(), tokenIds: new Set(), symbol: token.symbol || null, name: token.name || null, decimals: dec };
+        contracts.set(contract, e);
       }
+      const ttype = it.token_type || token.type;
+      if (ttype) e.types.add(ttype);
+      const tid = it.total && it.total.token_id != null ? String(it.total.token_id) : null;
+      if (tid != null && e.tokenIds.size < TOKEN_IDS_PER_CONTRACT_CAP) e.tokenIds.add(tid);
     }
-    const transfers = await loadBlockscoutTransfers(chain, address);
-    return computeReport(chain, address, `${chainLabel} Blockscout`, transfers, analyzedAt);
-  } catch (error) {
-    const failure = error instanceof SourceFailure ? error : new SourceFailure("The chain data source is unavailable right now.");
-    return {
-      status: "error", chain, chainLabel, address, analyzedAt,
-      source: `${chainLabel} Blockscout`,
-      code: failure.code,
-      message: failure.message,
-    };
+    if (onProgress) onProgress(pages);
+    const npp = j.next_page_params;
+    if (!npp) break;
+    if (pages >= DISCOVERY_PAGE_CAP) { truncated = true; break; }
+    pageParams = npp;
   }
+  return { contracts, pages, totalSeen, truncated, pageError };
 }
 
-/* ---- UI ---- */
-
-const $ = (id) => document.getElementById(id);
-let scanToken = 0;
-
-function metricRow(label, value, note) {
-  return `<div class="metric-row"><div><p class="metric-label">${esc(label)}</p><p class="metric-note">${esc(note)}</p></div><strong class="metric-value">${esc(value)}</strong></div>`;
-}
-
-function formulaRow(label, value, max) {
-  const width = Math.max(0, Math.min(100, (value / max) * 100));
-  return `<div class="formula-row"><div class="formula-row-head"><span>${esc(label)}</span><strong>${value.toFixed(1)} / ${max}</strong></div><div class="formula-track" aria-hidden="true"><span style="width:${width}%"></span></div></div>`;
-}
-
-function renderReport(report) {
-  const m = report.metrics;
-  const longestName = m.longestHeld.collectionName ?? shortAddress(m.longestHeld.contract);
-  $("result").innerHTML = `
-  <section class="report-shell" aria-labelledby="report-rating">
-    <div class="score-panel">
-      <div class="score-stamp" style="--score-angle:${report.score * 3.6}deg" aria-label="Score ${report.score} out of 100">
-        <div class="score-core"><strong>${report.score}</strong><span>/100</span></div>
-      </div>
-      <div class="score-copy">
-        <p class="mono-kicker">${esc(report.chainLabel)} / ${esc(shortAddress(report.address))}</p>
-        <h2 id="report-rating">${esc(report.rating)}</h2>
-        <p>Scored from ${m.acquisitionCycles.toLocaleString()} acquisition cycles across ${m.totalDistinctNfts.toLocaleString()} distinct NFTs.</p>
-      </div>
-    </div>
-    <div class="report-grid">
-      <div class="metrics-sheet">
-        <div class="section-heading"><span>Holding behavior</span><span>RESULT</span></div>
-        ${metricRow("Average hold", formatDuration(m.averageHoldDays), "Includes NFTs still held")}
-        ${metricRow("Flipped within 7 days", `${m.flip7Percent}%`, `${m.flip7EligibleCycles.toLocaleString()} cycles with a known 7-day outcome`)}
-        ${metricRow("Flipped within 30 days", `${m.flip30Percent}%`, `${m.flip30EligibleCycles.toLocaleString()} cycles with a known 30-day outcome`)}
-        ${metricRow("Average time to sell*", formatDuration(m.averageTimeToSellDays), `${m.soldCycles.toLocaleString()} matched outbound transfers`)}
-        ${metricRow("NFTs ever held", m.totalDistinctNfts.toLocaleString(), "Distinct contract + token ID pairs")}
-        ${metricRow("Current holdings", m.currentHoldings.toLocaleString(), "Open holding cycles")}
-        <div class="longest-hold">
-          <p class="metric-label">Longest hold</p>
-          <strong>${esc(formatDuration(m.longestHeld.durationDays))}</strong>
-          <p>${esc(longestName)} #${esc(m.longestHeld.tokenId)}${m.longestHeld.ongoing ? " · still held" : ""}</p>
-        </div>
-      </div>
-      <div class="method-sheet">
-        <div class="section-heading"><span>Score anatomy</span><span>${report.score} PTS</span></div>
-        ${formulaRow("Hold duration", report.formula.holdPoints, 50)}
-        ${formulaRow("7-day discipline", report.formula.sevenDayPoints, 30)}
-        ${formulaRow("30-day discipline", report.formula.thirtyDayPoints, 20)}
-        <details>
-          <summary>Show the exact formula</summary>
-          <code>${esc(report.formula.explanation)}</code>
-          <p>80–100 Diamond Hands · 60–79 Steady Holder · 35–59 Active Flipper · 0–34 Paper Hands. A score waits until at least one acquisition has a known 30-day outcome.</p>
-        </details>
-        <p class="method-note">*A transfer feed cannot prove a sale. “Flip” and “time to sell” use the first outbound transfer after acquisition as a transparent proxy; gifts and wallet moves can affect the result.</p>
-      </div>
-    </div>
-    <div class="receipt-block">
-      <div class="section-heading"><span>X-ready receipt</span><span>PLAIN TEXT</span></div>
-      <pre id="receipt-text">${esc(report.receipt)}</pre>
-      <button class="copy-button" type="button" id="copy-button" aria-label="Copy X-ready receipt">Copy receipt</button>
-    </div>
-    <div class="report-footer">
-      <span>Source: ${esc(report.source)}</span>
-      <span>Checked ${esc(formatTimestamp(report.analyzedAt))}</span>
-    </div>
-  </section>`;
-  $("copy-button").addEventListener("click", async () => {
-    const button = $("copy-button");
+// Classify each discovered contract with onchain calls:
+// balanceOf > 0, then decimals() ok => ERC-20; else supportsInterface(721)
+// => ERC-721 (tokenIds verified via ownerOf); ERC-1155 ids via balanceOf(id).
+// Worst-case guard: CLASSIFY_CONTRACT_CAP contracts, then an honest note.
+async function classifyTokens(addr, discovered, onProgress, signal) {
+  const entries = [...discovered.contracts.entries()];
+  const truncated = entries.length > CLASSIFY_CONTRACT_CAP;
+  const work = truncated ? entries.slice(0, CLASSIFY_CONTRACT_CAP) : entries;
+  const erc20 = [];
+  const erc721 = [];
+  const erc1155 = [];
+  let done = 0;
+  const tasks = work.map(([contract, info]) => async () => {
     try {
-      await navigator.clipboard.writeText(report.receipt);
-    } catch {
-      const textarea = document.createElement("textarea");
-      textarea.value = report.receipt;
-      textarea.style.position = "fixed";
-      textarea.style.opacity = "0";
-      document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand("copy");
-      textarea.remove();
+      const balRaw = await ethCall(contract, encBalanceOf(addr), 'latest', signal);
+      const bal = decodeUint(balRaw);
+      if (bal == null || bal === 0n) return; // not held now
+      const decRaw = await ethCall(contract, SEL_DECIMALS, 'latest', signal);
+      const dec = decodeUint(decRaw);
+      if (dec != null && dec <= 36n) {
+        let symbol = info.symbol;
+        if (!symbol) {
+          try {
+            const symRaw = await ethCall(contract, SEL_SYMBOL, 'latest', signal);
+            symbol = decodeString(symRaw);
+          } catch (e) { /* leave null */ }
+        }
+        erc20.push({
+          contract, symbol: symbol || shortAddr(contract), decimals: Number(dec),
+          balance: bal, curated: false,
+        });
+        return;
+      }
+      const supRaw = await ethCall(contract, encSupportsInterface(IFACE_ERC721), 'latest', signal);
+      if (decodeUint(supRaw) === 1n) {
+        const ids = [...info.tokenIds];
+        const held = [];
+        const idsTruncated = ids.length >= TOKEN_IDS_PER_CONTRACT_CAP;
+        for (const id of ids) {
+          checkAborted(signal);
+          try {
+            const ownRaw = await ethCall(contract, encOwnerOf(id), 'latest', signal);
+            const owner = decodeUint(ownRaw);
+            if (owner != null && '0x' + owner.toString(16).padStart(40, '0') === normAddr(addr)) {
+              held.push(id);
+            }
+          } catch (e) { /* skip unverifiable id */ }
+        }
+        if (held.length > 0) erc721.push({ contract, tokenIds: held, idsTruncated });
+        return;
+      }
+      // ERC-1155 (or unknown): confirm per-id balances from discovery.
+      const ids = [...info.tokenIds];
+      const held = [];
+      for (const id of ids) {
+        checkAborted(signal);
+        try {
+          const raw = await ethCall(contract, encBalanceOf1155(addr, id), 'latest', signal);
+          const bal1155 = decodeUint(raw);
+          if (bal1155 != null && bal1155 > 0n) held.push({ id, balance: bal1155 });
+        } catch (e) { /* skip */ }
+      }
+      if (held.length > 0) erc1155.push({ contract, holdings: held });
+      // else: not a recognizable held token standard — skipped silently
+    } finally {
+      done++;
+      if (onProgress) onProgress(done, work.length);
     }
-    button.textContent = "Copied";
-    setTimeout(() => { button.textContent = "Copy receipt"; }, 1800);
+  });
+  await pool(tasks, CONCURRENCY, null, signal);
+  erc20.sort((a, b) => a.symbol.localeCompare(b.symbol));
+  return { erc20, erc721, erc1155, truncatedContracts: truncated, totalContracts: entries.length };
+}
+
+// 5. Bridge withdrawals: MessagePassed events from the L2ToL1MessagePasser
+//    with sender == addr. Raw eth_getLogs (address-filtered chunks) — the
+//    verified onchain path. See the honesty note in the header comment.
+//    Age is estimated from block numbers (Base ~2s/block) — accurate enough
+//    for the >30-day heuristic and avoids a per-log block-timestamp RPC,
+//    which would serialize thousands of calls for busy senders.
+const WITHDRAWAL_LIST_CAP = 200; // show most recent; note the rest honestly
+
+async function scanWithdrawals(addr, fromBlock, toBlock, onProgress, signal) {
+  const logs = await getLogsChunked(
+    { address: L2_TO_L1_PASSER, topics: [TOPIC_MESSAGE_PASSED, null, addrToTopic(addr)] },
+    fromBlock, toBlock, onProgress, signal
+  );
+  const nowS = Math.floor(Date.now() / 1000);
+  const out = [];
+  for (const l of logs) {
+    checkAborted(signal);
+    try {
+      const blockNumber = parseInt(l.blockNumber, 16);
+      const target = topicToAddr(l.topics[3]);
+      const value = decodeUint(l.data);
+      const dataHex = l.data.slice(2);
+      const withdrawalHash = '0x' + dataHex.slice(96 * 2, 128 * 2);
+      const ageDays = (toBlock - blockNumber) * 2 / 86400;
+      out.push({
+        txHash: l.transactionHash,
+        blockNumber,
+        target,
+        valueWei: value,
+        withdrawalHash,
+        ageDays,
+        stuck: ageDays > STUCK_DAYS,
+      });
+    } catch (e) { /* malformed log, skip */ }
+  }
+  out.sort((a, b) => b.blockNumber - a.blockNumber);
+  const truncated = out.length > WITHDRAWAL_LIST_CAP;
+  return {
+    items: truncated ? out.slice(0, WITHDRAWAL_LIST_CAP) : out,
+    total: out.length,
+    truncated,
+  };
+}
+
+// 6. Unclaimed Merkl rewards (public GET API)
+function normalizeMerkl(json) {
+  const out = [];
+  const push = (r) => {
+    if (!r || typeof r !== 'object') return;
+    const token = r.token || r.rewardToken || {};
+    let amount;
+    try { amount = BigInt(r.amount || r.claimable || '0'); } catch (e) { return; }
+    if (amount <= 0n) return;
+    const dec = Number.isSafeInteger(token.decimals) ? token.decimals
+      : (Number.isSafeInteger(r.decimals) ? r.decimals : 18);
+    const usd = typeof r.usdValue === 'number' ? r.usdValue
+      : (typeof r.valueUsd === 'number' ? r.valueUsd : null);
+    out.push({
+      symbol: token.symbol || r.symbol || 'UNKNOWN',
+      decimals: dec, amount, usd,
+      tokenAddress: token.address || r.tokenAddress || null,
+    });
+  };
+  const arr = Array.isArray(json) ? json : (json && Array.isArray(json.rewards) ? json.rewards : []);
+  for (const item of arr) {
+    if (item && Array.isArray(item.rewards)) item.rewards.forEach(push);
+    else push(item);
+  }
+  return out;
+}
+
+async function scanMerkl(addr, signal) {
+  const url = MERKL_API.replace('{address}', addr);
+  const j = await fetchJson(url, { signal });
+  return normalizeMerkl(j);
+}
+
+// Orchestrator. onSection(result) fires after each section completes so the
+// UI can render progressively. Throws AbortError on cancel/timeout.
+async function runScan(addr, progress, onSection, signal) {
+  const P = progress || (() => {});
+  const S = onSection || (() => {});
+  const result = { address: addr, sections: {}, failed: {}, notes: [] };
+
+  P(2, 'checking chain…');
+  await checkChainId(signal);
+  const latest = await getBlockNumber(signal);
+  const toBlock = parseInt(latest, 16);
+  const fromBlock = Math.max(0, toBlock - SCAN_BLOCKS);
+  result.scanRange = { fromBlock, toBlock };
+
+  let ethUsd = null;
+  try { ethUsd = await fetchEthUsd(signal); } catch (e) { /* USD context unavailable */ }
+  result.ethUsd = ethUsd;
+
+  P(4, 'reading native ETH balance…');
+  try { result.sections.native = await scanNative(addr, ethUsd, signal); }
+  catch (e) { failOrAbort(result, 'native', e); }
+  S(result);
+
+  P(8, 'checking curated tokens…');
+  let curated = [];
+  try { curated = await scanCurated(addr, signal); }
+  catch (e) { failOrAbort(result, 'erc20curated', e); }
+  S(result);
+
+  P(12, 'discovering token transfers (indexed)…');
+  let discovered = null;
+  try {
+    discovered = await discoverViaBlockscout(addr,
+      (pages) => P(12 + Math.min(8, pages), 'discovering token transfers (' + pages + ' pages)…'), signal);
+    if (discovered.truncated) {
+      result.notes.push(discovered.pageError
+        ? 'Token-transfer discovery hit an API error partway — showing the most recent ~' +
+          discovered.totalSeen + ' transfers. Some holdings may be missed.'
+        : 'Transfer history is very large — showing the most recent ~' +
+          discovered.totalSeen + ' transfers. Some holdings may be missed.');
+    }
+  } catch (e) { failOrAbort(result, 'discovery', e); }
+  S(result);
+
+  if (discovered) {
+    P(22, 'classifying token contracts…');
+    try {
+      const c = await classifyTokens(addr, discovered,
+        (d, t) => P(22 + Math.round(20 * d / t), 'classifying token contracts (' + d + '/' + t + ')…'), signal);
+      const seen = new Set(curated.map((x) => normAddr(x.contract)));
+      result.sections.erc20 = [...curated, ...c.erc20.filter((x) => !seen.has(normAddr(x.contract)))];
+      result.sections.erc721 = c.erc721;
+      result.sections.erc1155 = c.erc1155;
+      if (c.truncatedContracts) {
+        result.notes.push('Too many token contracts to check in-browser (' +
+          c.totalContracts + ' found) — showing the first ' + CLASSIFY_CONTRACT_CAP + '.');
+      }
+    } catch (e) { failOrAbort(result, 'classify', e); }
+  } else {
+    result.sections.erc20 = curated;
+    result.sections.erc721 = null;
+    result.sections.erc1155 = null;
+  }
+  S(result);
+
+
+  P(44, 'scanning bridge withdrawals…');
+  try {
+    const w = await scanWithdrawals(addr, fromBlock, toBlock,
+      (d, t) => P(44 + Math.round(44 * d / t), 'scanning bridge withdrawals (' + d + '/' + t + ' chunks)…'), signal);
+    result.sections.withdrawals = w;
+    if (w.truncated) {
+      result.notes.push(w.total.toLocaleString('en-US') + ' bridge withdrawals found — showing the ' +
+        WITHDRAWAL_LIST_CAP + ' most recent.');
+    }
+  } catch (e) { failOrAbort(result, 'withdrawals', e); }
+  S(result);
+
+  P(90, 'checking Merkl rewards…');
+  try { result.sections.merkl = await scanMerkl(addr, signal); }
+  catch (e) { failOrAbort(result, 'merkl', e); }
+  S(result);
+
+  P(100, 'done.');
+  return result;
+}
+
+function failOrAbort(result, key, e) {
+  if (e && e.name === 'AbortError') throw e;
+  result.failed[key] = 'section unavailable — ' + e.message;
+}
+
+/* ============================ rendering (DOM) ============================ */
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+}
+
+function extLink(href, text, mono) {
+  const a = document.createElement('a');
+  a.href = href;
+  a.target = '_blank';
+  a.rel = 'noopener';
+  a.textContent = text;
+  if (mono) a.className = 'mono';
+  return a;
+}
+
+function basescanAddr(a) { return 'https://basescan.org/address/' + a; }
+function basescanTx(h) { return 'https://basescan.org/tx/' + h; }
+
+function findingCard(sev, title) {
+  const card = el('div', 'finding sev-' + sev);
+  card.appendChild(el('h3', null, title));
+  return card;
+}
+
+function errorCard(title, msg) {
+  const card = findingCard('bad', title);
+  card.appendChild(el('p', null, msg));
+  return card;
+}
+
+function holdingRow(leftNode, amountText, usdText) {
+  const row = el('div', 'holding');
+  const left = el('div');
+  left.appendChild(leftNode);
+  row.appendChild(left);
+  const right = el('div', 'amount', amountText);
+  if (usdText) {
+    right.appendChild(el('span', 'usd', '  ' + usdText));
+  }
+  row.appendChild(right);
+  return row;
+}
+
+function renderNative(s, ethUsd) {
+  const eth = Number(s.wei) / 1e18;
+  let card;
+  if (s.wei === 0n) {
+    card = findingCard('info', 'Native ETH');
+    card.appendChild(el('p', null, 'No native ETH at this address.'));
+  } else if (s.dust) {
+    card = findingCard('info', 'Native ETH — dust');
+    card.appendChild(el('p', null,
+      'Dust balance (under ~$1 at current prices). Probably not worth moving on its own, but it counts toward gas.'));
+  } else {
+    card = findingCard('ok', 'Native ETH');
+  }
+  if (s.wei > 0n) {
+    const usd = s.usd != null ? formatUsd(s.usd) : 'price unavailable';
+    card.appendChild(holdingRow(el('span', 'mono', 'ETH (native)'), eth.toFixed(6) + ' ETH', usd));
+  }
+  return card;
+}
+
+function renderErc20(list) {
+  const card = findingCard(list.length ? 'ok' : 'info', 'ERC-20 tokens');
+  if (!list.length) {
+    card.appendChild(el('p', 'muted',
+      'No ERC-20 balances found (curated list + full transfer history).'));
+    return card;
+  }
+  for (const t of list) {
+    const left = el('span');
+    left.appendChild(el('strong', null, t.symbol + '  '));
+    left.appendChild(extLink(basescanAddr(t.contract), shortAddr(t.contract), true));
+    card.appendChild(holdingRow(left, formatUnits(t.balance, t.decimals) + ' ' + t.symbol, null));
+  }
+  return card;
+}
+
+function renderErc721(list) {
+  const card = findingCard(list.length ? 'ok' : 'info', 'ERC-721 NFTs');
+  if (!list.length) {
+    card.appendChild(el('p', 'muted', 'No ERC-721 holdings verified in the transfer history.'));
+    return card;
+  }
+  for (const n of list) {
+    const p = el('p');
+    p.appendChild(el('strong', null, 'Contract '));
+    p.appendChild(extLink(basescanAddr(n.contract), shortAddr(n.contract), true));
+    p.appendChild(el('span', null, ' — token IDs held: '));
+    n.tokenIds.forEach((id, i) => {
+      if (i > 0) p.appendChild(document.createTextNode(', '));
+      p.appendChild(extLink('https://basescan.org/token/' + n.contract + '?a=' + id, '#' + id, true));
+    });
+    if (n.idsTruncated) p.appendChild(el('span', 'muted', ' (+more — capped in-browser)'));
+    card.appendChild(p);
+  }
+  return card;
+}
+
+function render1155(list) {
+  const card = findingCard(list.length ? 'ok' : 'info', 'ERC-1155 editions');
+  if (!list.length) {
+    card.appendChild(el('p', 'muted', 'No ERC-1155 balances confirmed in the transfer history.'));
+    return card;
+  }
+  for (const h of list) {
+    for (const item of h.holdings) {
+      const left = el('span');
+      left.appendChild(extLink(basescanAddr(h.contract), shortAddr(h.contract), true));
+      left.appendChild(el('span', 'mono', '  id ' + item.id));
+      card.appendChild(holdingRow(left, '× ' + item.balance.toString(), null));
+    }
+  }
+  return card;
+}
+
+function renderWithdrawals(w) {
+  const list = (w && w.items) || [];
+  const card = findingCard(list.length ? 'warn' : 'info', 'Base → L1 withdrawals');
+  const note = el('p', 'fineprint',
+    'Detected from MessagePassed events on the L2ToL1MessagePasser. ' +
+    'This app does NOT check L1 finalization status — a withdrawal is only complete after it is ' +
+    'proven and finalized. "Likely stuck" below is purely an age heuristic (>30 days), not a finality verdict. ' +
+    'Verify and complete every withdrawal in the official bridge app.');
+  card.appendChild(note);
+  if (w && w.truncated) {
+    card.appendChild(el('p', 'scope-note warn-note',
+      'Note: ' + w.total.toLocaleString('en-US') + ' withdrawals found — showing the ' +
+      WITHDRAWAL_LIST_CAP + ' most recent.'));
+  }
+  if (!list.length) {
+    card.appendChild(el('p', 'muted', 'No bridge withdrawals found in the scan window.'));
+    return card;
+  }
+  for (const w of list) {
+    const box = el('div', 'finding sev-' + (w.stuck ? 'bad' : 'warn'));
+    box.style.margin = '10px 0';
+    const title = w.stuck ? 'LIKELY STUCK — initiated ' : 'Withdrawal — initiated ';
+    const age = w.ageDays != null ? Math.floor(w.ageDays) + ' days ago' : 'unknown time ago';
+    box.appendChild(el('h3', null, title + age));
+    const dl = el('dl', 'kv');
+    const rows = [
+      ['To (L1 target)', w.target, true],
+      ['Value', w.valueWei != null ? formatUnits(w.valueWei, 18) + ' ETH' : 'unknown'],
+      ['Withdrawal hash', w.withdrawalHash.slice(0, 18) + '…', true],
+    ];
+    for (const [k, v, mono] of rows) {
+      const div = el('div');
+      div.appendChild(el('dt', null, k));
+      const dd = el('dd', mono ? 'mono small' : null, v);
+      div.appendChild(dd);
+      dl.appendChild(div);
+    }
+    box.appendChild(dl);
+    const links = el('p');
+    links.appendChild(extLink(basescanTx(w.txHash), 'View tx on Basescan', true));
+    links.appendChild(document.createTextNode('  ·  '));
+    links.appendChild(extLink('https://bridge.base.org', 'Complete / verify in the official bridge'));
+    box.appendChild(links);
+    card.appendChild(box);
+  }
+  return card;
+}
+
+function renderMerkl(list) {
+  const card = findingCard(list.length ? 'ok' : 'info', 'Unclaimed Merkl rewards');
+  if (!list.length) {
+    card.appendChild(el('p', 'muted',
+      'No unclaimed Merkl rewards found for this address. (Other distributors are roadmap.)'));
+    return card;
+  }
+  for (const r of list) {
+    const left = el('span');
+    left.appendChild(el('strong', null, r.symbol + '  '));
+    if (r.tokenAddress) left.appendChild(extLink(basescanAddr(r.tokenAddress), shortAddr(r.tokenAddress), true));
+    card.appendChild(holdingRow(left,
+      formatUnits(r.amount, r.decimals) + ' ' + r.symbol,
+      r.usd != null ? formatUsd(r.usd) : null));
+  }
+  const p = el('p');
+  p.appendChild(extLink('https://merkl.xyz', 'Claim on merkl.xyz'));
+  card.appendChild(p);
+  return card;
+}
+
+// Renders whatever sections have completed so far (progressive) or the full
+// result at the end. Sections that haven't run yet are skipped, not faked.
+function renderFindings(result, partial) {
+  const host = document.getElementById('findings');
+  host.textContent = '';
+  const F = result.failed, S = result.sections;
+
+  if (result.scanRange) {
+    const range = result.scanRange;
+    const scope = el('p', 'scope-note',
+      'Token discovery: full transfer history via Blockscout\'s indexed API. ' +
+      'Bridge-withdrawal scan: blocks ' + range.fromBlock.toLocaleString('en-US') + ' → ' +
+      range.toBlock.toLocaleString('en-US') + ' on Base (~46 days).');
+    host.appendChild(scope);
+  }
+  for (const n of result.notes || []) {
+    host.appendChild(el('p', 'scope-note warn-note', 'Note: ' + n));
+  }
+
+  const has = (k) => (k in S) || (k in F);
+  if (has('native')) host.appendChild(F.native ? errorCard('Native ETH', F.native) : renderNative(S.native, result.ethUsd));
+  if (has('erc20') || has('erc20curated')) {
+    if (F.erc20curated && !('erc20' in S)) host.appendChild(errorCard('ERC-20 tokens', F.erc20curated));
+    else if ('erc20' in S) host.appendChild(renderErc20(S.erc20 || []));
+  }
+  if (F.discovery && !partial && !('erc20' in S)) host.appendChild(errorCard('Token discovery', F.discovery));
+  if (has('classify') || has('erc721')) {
+    if (F.classify) host.appendChild(errorCard('Token classification', F.classify));
+    else if (F.discovery) host.appendChild(errorCard('ERC-721 / ERC-1155 discovery',
+      F.discovery + ' — only the curated ERC-20 list could be checked.'));
+    else {
+      if ('erc721' in S && S.erc721) host.appendChild(renderErc721(S.erc721));
+      if ('erc1155' in S && S.erc1155) host.appendChild(render1155(S.erc1155));
+    }
+  }
+  if (has('withdrawals')) host.appendChild(F.withdrawals ? errorCard('Base → L1 withdrawals', F.withdrawals) : renderWithdrawals(S.withdrawals));
+  if (has('merkl')) host.appendChild(F.merkl ? errorCard('Unclaimed Merkl rewards', F.merkl) : renderMerkl(S.merkl || []));
+  if (partial) host.appendChild(el('p', 'muted', 'Scan in progress — more sections below as they complete…'));
+}
+
+/* ============================ $RESCUE price panel ============================ */
+
+async function loadRescuePrice() {
+  const box = document.getElementById('rescue-price');
+  let j;
+  try {
+    const res = await fetch(DEXSCREENER_API);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    j = await res.json();
+  } catch (e) {
+    box.textContent = '';
+    box.appendChild(el('p', 'muted', 'Market data unavailable right now.'));
+    box.appendChild(extLink('https://basescan.org/token/' + RESCUE_TOKEN, 'View $RESCUE on Basescan', true));
+    return;
+  }
+  const pairs = j && j.pairs;
+  box.textContent = '';
+  if (!pairs || pairs.length === 0) {
+    box.appendChild(el('p', null, 'Not indexed by DEXScreener yet.'));
+    box.appendChild(el('p', 'fineprint',
+      'No price is shown because there is no market data — a missing price is not a $0 price.'));
+    box.appendChild(extLink('https://basescan.org/token/' + RESCUE_TOKEN, 'View $RESCUE on Basescan', true));
+    return;
+  }
+  const sorted = [...pairs].sort((a, b) => ((b.liquidity && b.liquidity.usd) || 0) - ((a.liquidity && a.liquidity.usd) || 0));
+  const p = sorted[0];
+  const price = parseFloat(p.priceUsd);
+  box.appendChild(el('p', 'price-big', isFinite(price) ? '$' + price.toPrecision(4) : '—'));
+  const row = el('div', 'price-row');
+  if (p.priceChange && p.priceChange.h24 != null) {
+    const chg = parseFloat(p.priceChange.h24);
+    row.appendChild(el('span', chg >= 0 ? 'up' : 'down', '24h ' + (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%'));
+  }
+  if (p.liquidity && p.liquidity.usd != null) row.appendChild(el('span', 'muted', 'Liq ' + formatUsd(p.liquidity.usd)));
+  if (p.fdv != null) row.appendChild(el('span', 'muted', 'FDV ' + formatUsd(p.fdv)));
+  if (p.dexId) row.appendChild(el('span', 'muted', String(p.dexId)));
+  box.appendChild(row);
+  const lp = el('p', 'fineprint');
+  lp.appendChild(extLink('https://basescan.org/token/' + RESCUE_TOKEN, 'View $RESCUE on Basescan', true));
+  box.appendChild(lp);
+}
+
+/* ============================ form wiring ============================ */
+
+function setProgress(pct, text) {
+  const bar = document.getElementById('progress');
+  bar.hidden = false;
+  document.getElementById('progress-fill').style.width = Math.max(0, Math.min(100, pct)) + '%';
+  document.getElementById('progress-text').textContent = text;
+}
+
+function initApp() {
+  loadRescuePrice();
+  const form = document.getElementById('scan-form');
+  const input = document.getElementById('addr-input');
+  const btn = document.getElementById('scan-btn');
+  const errBox = document.getElementById('addr-error');
+  const progressBox = document.getElementById('progress');
+
+  // Cancel button lives next to the progress bar.
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.id = 'scan-cancel';
+  cancelBtn.textContent = 'Cancel scan';
+  cancelBtn.hidden = true;
+  progressBox.appendChild(cancelBtn);
+
+  let scanCtrl = null;
+  let scanTimer = null;
+  let timedOut = false;
+
+  cancelBtn.addEventListener('click', () => {
+    if (scanCtrl) scanCtrl.abort();
+  });
+
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const addr = input.value.trim();
+    if (!isValidAddress(addr)) {
+      errBox.hidden = false;
+      errBox.textContent = 'Invalid address. Expected 0x followed by 40 hex characters — nothing was scanned.';
+      input.focus();
+      return;
+    }
+    errBox.hidden = true;
+    btn.disabled = true;
+    cancelBtn.hidden = false;
+    document.getElementById('findings').textContent = '';
+    scanCtrl = new AbortController();
+    clearTimeout(scanTimer);
+    timedOut = false;
+    scanTimer = setTimeout(() => { timedOut = true; if (scanCtrl) scanCtrl.abort(); }, SCAN_TIMEOUT_MS);
+    try {
+      setProgress(1, 'starting scan…');
+      const finalResult = await runScan(addr, setProgress,
+        (r) => renderFindings(r, true), scanCtrl.signal);
+      renderFindings(finalResult, false);
+      setProgress(100, 'done.');
+    } catch (e) {
+      const host = document.getElementById('findings');
+      if (e && e.name === 'AbortError') {
+        host.textContent = '';
+        host.appendChild(errorCard('Scan stopped',
+          'The scan was stopped before it could finish (' +
+          (timedOut ? 'it hit the 8-minute ceiling' : 'cancelled') +
+          '). No results are shown because a partial scan would be misleading — try again, ' +
+          'or check the address on basescan.org directly.'));
+        setProgress(100, 'stopped.');
+      } else {
+        host.textContent = '';
+        host.appendChild(errorCard('Scan failed', 'The scan could not start: ' + e.message));
+        setProgress(100, 'failed.');
+      }
+    } finally {
+      clearTimeout(scanTimer);
+      scanCtrl = null;
+      btn.disabled = false;
+      cancelBtn.hidden = true;
+    }
   });
 }
 
-function renderStatus(text, progress) {
-  $("result").innerHTML = `
-  <section class="status-panel" role="status" aria-live="polite">
-    <span class="scan-pulse" aria-hidden="true"></span>
-    <div style="flex:1">
-      <strong>Building the full transfer timeline</strong>
-      <p>${esc(text)}</p>
-      ${progress ? `<div class="status-progress" aria-hidden="true"><span id="scan-progress-fill"></span></div>` : ""}
-    </div>
-  </section>`;
-}
-
-function updateProgress(done, total) {
-  const fill = $("scan-progress-fill");
-  if (fill && total > 0) fill.style.width = `${Math.min(100, (done / total) * 100).toFixed(1)}%`;
-  const note = $("scan-progress-note");
-  if (note) note.textContent = `${done.toLocaleString()} of ${total.toLocaleString()} scan batches complete`;
-}
-
-function renderFetchError(message) {
-  $("result").innerHTML = `
-  <section class="error-panel" role="alert">
-    <p class="mono-kicker">SCAN FAILED</p>
-    <h2>The report could not be calculated.</h2>
-    <p>${esc(message)}</p>
-    <button type="button" id="retry-button">Try again</button>
-  </section>`;
-  $("retry-button").addEventListener("click", () => $("scan-form").requestSubmit());
-}
-
-function renderSourceError(data) {
-  const heading = data.code === "HISTORY_TOO_LARGE" ? "History exceeds the safe scan limit." : "Chain data is unavailable.";
-  $("result").innerHTML = `
-  <section class="error-panel" role="alert">
-    <p class="mono-kicker">NO SCORE ISSUED</p>
-    <h2>${esc(heading)}</h2>
-    <p>${esc(data.message)}</p>
-    <div class="error-meta">${esc(data.source)} · ${esc(formatTimestamp(data.analyzedAt))}</div>
-    <button type="button" id="retry-button">Retry live scan</button>
-  </section>`;
-  $("retry-button").addEventListener("click", () => $("scan-form").requestSubmit());
-}
-
-function renderNoHistory(data) {
-  $("result").innerHTML = `
-  <section class="empty-panel" role="status">
-    <div class="empty-mark">Ø</div>
-    <div>
-      <p class="mono-kicker">NO HISTORY</p>
-      <h2>No grade to give.</h2>
-      <p>${esc(data.message)}</p>
-      <div class="error-meta">${esc(data.chainLabel)} · ${esc(shortAddress(data.address))} · ${esc(formatTimestamp(data.analyzedAt))}</div>
-    </div>
-  </section>`;
-}
-
-function renderInsufficient(data) {
-  $("result").innerHTML = `
-  <section class="empty-panel" role="status">
-    <div class="empty-mark">…</div>
-    <div>
-      <p class="mono-kicker">EARLY READ</p>
-      <h2>Not enough history to grade.</h2>
-      <p>${esc(data.message)}</p>
-      <div class="early-facts">
-        <span>${data.acquisitionCycles.toLocaleString()} acquisition${data.acquisitionCycles === 1 ? "" : "s"}</span>
-        <span>${data.currentHoldings.toLocaleString()} held now</span>
-        <span>Oldest hold ${esc(formatDuration(data.oldestHoldDays))}</span>
-      </div>
-      <div class="error-meta">First possible 30-day read in about ${data.daysUntilEligible} day${data.daysUntilEligible === 1 ? "" : "s"} · ${esc(data.source)}</div>
-    </div>
-  </section>`;
-}
-
-function renderPrimer() {
-  $("result").innerHTML = `
-  <section class="primer" aria-label="How the rating works">
-    <div><span class="primer-number">50</span><p>points for average hold duration</p></div>
-    <div><span class="primer-number">30</span><p>points for avoiding 7-day flips</p></div>
-    <div><span class="primer-number">20</span><p>points for avoiding 30-day flips</p></div>
-  </section>`;
-}
-
-async function runScan() {
-  const address = $("wallet-address").value.trim();
-  const chain = $("chain-select").value;
-  if (!isAddress(address)) return;
-  const token = ++scanToken;
-  $("scan-button").disabled = true;
-  $("scan-button").textContent = "Reading chain…";
-  const isRobinhood = chain === "robinhood";
-  renderStatus(
-    isRobinhood
-      ? "Robinhood Chain is scanned directly from its public RPC in small history chunks. This can take several minutes for the full timeline — every chunk must be complete before a score is issued."
-      : "Older wallets can take longer because every page must be complete before a score is issued.",
-    isRobinhood,
-  );
-  try {
-    const data = await analyzeWallet(address, chain, (done, total) => {
-      if (token !== scanToken) return;
-      updateProgress(done, total);
-      const note = $("scan-progress-note");
-      if (!note) {
-        const panel = document.querySelector(".status-panel div");
-        if (panel) {
-          const p = document.createElement("p");
-          p.id = "scan-progress-note";
-          panel.appendChild(p);
-        }
-      }
-      updateProgress(done, total);
-    });
-    if (token !== scanToken) return;
-    if (data.status === "ok") renderReport(data);
-    else if (data.status === "no_history") renderNoHistory(data);
-    else if (data.status === "insufficient_history") renderInsufficient(data);
-    else renderSourceError(data);
-  } catch (error) {
-    if (token !== scanToken) return;
-    renderFetchError(error instanceof Error ? error.message : "The request did not complete.");
-  } finally {
-    if (token === scanToken) {
-      $("scan-button").disabled = false;
-      $("scan-button").textContent = "Grade this wallet";
-    }
+if (typeof document !== 'undefined') {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initApp);
+  } else {
+    initApp();
   }
 }
-
-function wireForm() {
-  const input = $("wallet-address");
-  const form = $("scan-form");
-  const button = $("scan-button");
-  const hint = $("wallet-hint");
-  const validate = () => {
-    const value = input.value.trim();
-    if (!value) { hint.textContent = "Any public EVM wallet. Nothing is connected or signed."; hint.className = "field-hint"; input.setAttribute("aria-invalid", "false"); return true; }
-    const ok = isAddress(value);
-    hint.textContent = ok ? "Any public EVM wallet. Nothing is connected or signed." : "Use a 42-character 0x wallet address.";
-    hint.className = ok ? "field-hint" : "field-error";
-    input.setAttribute("aria-invalid", ok ? "false" : "true");
-    return ok;
-  };
-  input.addEventListener("input", () => { validate(); button.disabled = !input.value.trim() || !isAddress(input.value.trim()); });
-  button.disabled = true;
-  form.addEventListener("submit", (event) => { event.preventDefault(); if (validate() && isAddress(input.value.trim())) runScan(); });
-}
-
-document.addEventListener("DOMContentLoaded", () => {
-  wireForm();
-  renderPrimer();
-});
